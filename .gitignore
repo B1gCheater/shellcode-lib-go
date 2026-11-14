@@ -1,0 +1,13 @@
+# Generated binaries and local build output. Do not ignore the donut package.
+*.exe
+*.dll
+*.bin
+*.obj
+*.pdb
+*.lib
+*.exp
+*.test
+*.out
+/build/
+/tmp/
+.DS_Store

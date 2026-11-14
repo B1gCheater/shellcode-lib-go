@@ -1,0 +1,4 @@
+# Keep source and native patch line endings consistent across platforms.
+* text=auto eol=lf
+# Unified diffs retain whitespace from the original source as context.
+*.patch -whitespace

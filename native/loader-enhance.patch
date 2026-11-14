@@ -1,0 +1,365 @@
+--- a/loader/inmem_pe.c
++++ b/loader/inmem_pe.c
+@@ -40,11 +40,165 @@
+     WORD type   :4;
+ } IMAGE_RELOC, *PIMAGE_RELOC;
+ 
++// Names that are not in the instance's API table have to be resolved by string
++// through GetProcAddress. exe2h ships only .text, so an ordinary literal (which
++// lands in .rdata) would point outside the shellcode. Build them in a stack
++// buffer byte by byte instead: volatile stores cannot be folded back into a
++// read-only constant.
++static void name_ntdll(volatile char *p) {
++    p[0]='n'; p[1]='t'; p[2]='d'; p[3]='l'; p[4]='l'; p[5]=0;
++}
++
++static void name_rtladdfunctiontable(volatile char *p) {
++    p[0]='R';  p[1]='t';  p[2]='l';  p[3]='A';  p[4]='d';  p[5]='d';
++    p[6]='F';  p[7]='u';  p[8]='n';  p[9]='c';  p[10]='t'; p[11]='i';
++    p[12]='o'; p[13]='n'; p[14]='T'; p[15]='a'; p[16]='b'; p[17]='l';
++    p[18]='e'; p[19]=0;
++}
++
++#ifdef _WIN64
++static void name_rtlpctofileheader(volatile char *p) {
++    p[0]='R'; p[1]='t';  p[2]='l';  p[3]='P';  p[4]='c';  p[5]='T';
++    p[6]='o'; p[7]='F';  p[8]='i';  p[9]='l';  p[10]='e'; p[11]='H';
++    p[12]='e'; p[13]='a'; p[14]='d'; p[15]='e'; p[16]='r'; p[17]=0;
++}
++
++#endif
++
+ typedef BOOL  (WINAPI *DllMain_t)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
+ typedef VOID  (WINAPI *Start_t)(PPEB);
+ typedef VOID  (WINAPI *DllParam_t)(PVOID);
+ typedef VOID  (WINAPI *DllVoid_t)(VOID);
+ 
++#ifdef _WIN64
++// C++ exceptions in a manually mapped image.
++//
++// _CxxThrowException identifies the throwing module with
++// RtlPcToFileHeader(pThrowInfo). The image is not in the loader's module list, so
++// the call returns NULL and the runtime raises a *foreign* exception (magic
++// 0x1994000); FindHandler never matches a catch, even catch(...). Measured: with
++// the call answered normally, the same throw reaches its catch.
++//
++// Hook that import inside every loaded module (vcruntime140[_1] for /MD) and in
++// the payload image itself (/MT), with a small stub that answers for addresses in
++// the mapped image and forwards everything else to the real function. The stub is
++// position independent and embeds base/end/original, so it owns no state outside
++// its own page.
++static PVOID make_pc2f_stub(PDONUT_INSTANCE inst, ULONG_PTR base, ULONG_PTR end, PVOID orig) {
++    BYTE *s = (BYTE*)inst->api.VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
++    if (s == NULL) return NULL;
++
++    #ifdef _WIN64
++      // rcx = pc, rdx = base*
++      s[0]=0x49; s[1]=0xB8; *(ULONG_PTR*)(s+2)  = base;   // mov r8, base
++      s[10]=0x49; s[11]=0xB9; *(ULONG_PTR*)(s+12) = end;    // mov r9, end
++      s[20]=0x4C; s[21]=0x39; s[22]=0xC1;                   // cmp rcx, r8
++      s[23]=0x72; s[24]=0x11;                               // jb pass
++      s[25]=0x4C; s[26]=0x39; s[27]=0xC9;                   // cmp rcx, r9
++      s[28]=0x73; s[29]=0x0C;                               // jae pass
++      s[30]=0x48; s[31]=0x85; s[32]=0xD2;                   // test rdx, rdx
++      s[33]=0x74; s[34]=0x03;                               // jz retbase
++      s[35]=0x4C; s[36]=0x89; s[37]=0x02;                   // mov [rdx], r8
++      s[38]=0x4C; s[39]=0x89; s[40]=0xC0;                   // mov rax, r8  (retbase)
++      s[41]=0xC3;                                           // ret
++      s[42]=0x48; s[43]=0xB8; *(ULONG_PTR*)(s+44) = (ULONG_PTR)orig; // mov rax, orig (pass)
++      s[52]=0xFF; s[53]=0xE0;                               // jmp rax
++    #else
++      // [esp+4] = pc, [esp+8] = base*; NTAPI, so ret 8
++      s[0]=0x8B; s[1]=0x44; s[2]=0x24; s[3]=0x04;           // mov eax, [esp+4]
++      s[4]=0xB9;  *(ULONG_PTR*)(s+5)  = base;               // mov ecx, base
++      s[9]=0x39; s[10]=0xC8;                                // cmp eax, ecx
++      s[11]=0x72; s[12]=0x18;                               // jb pass
++      s[13]=0xBA; *(ULONG_PTR*)(s+14) = end;                // mov edx, end
++      s[18]=0x39; s[19]=0xD0;                               // cmp eax, edx
++      s[20]=0x73; s[21]=0x0F;                               // jae pass
++      s[22]=0x8B; s[23]=0x54; s[24]=0x24; s[25]=0x08;       // mov edx, [esp+8]
++      s[26]=0x85; s[27]=0xD2;                               // test edx, edx
++      s[28]=0x74; s[29]=0x02;                               // jz retbase
++      s[30]=0x89; s[31]=0x0A;                               // mov [edx], ecx
++      s[32]=0x89; s[33]=0xC8;                               // mov eax, ecx (retbase)
++      s[34]=0xC2; s[35]=0x08; s[36]=0x00;                   // ret 8
++      s[37]=0xB8; *(ULONG_PTR*)(s+38) = (ULONG_PTR)orig;    // mov eax, orig (pass)
++      s[42]=0xFF; s[43]=0xE0;                               // jmp eax
++    #endif
++    return s;
++}
++
++static void patch_pc2f_module(PDONUT_INSTANCE inst, PVOID base, DWORD importRVA, PVOID stub) {
++    PIMAGE_IMPORT_DESCRIPTOR imp;
++    PIMAGE_THUNK_DATA oft, ft;
++    PIMAGE_IMPORT_BY_NAME ibn;
++    char target[20];
++    DWORD old;
++
++    if (base == NULL || importRVA == 0) return;
++    name_rtlpctofileheader(target);
++    imp = RVA2VA(PIMAGE_IMPORT_DESCRIPTOR, base, importRVA);
++
++    for (; imp->Name != 0; imp++) {
++        ft = RVA2VA(PIMAGE_THUNK_DATA, base, imp->FirstThunk);
++        oft = imp->OriginalFirstThunk ?
++                RVA2VA(PIMAGE_THUNK_DATA, base, imp->OriginalFirstThunk) : ft;
++        for (; oft->u1.AddressOfData != 0; oft++, ft++) {
++            if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
++            ibn = RVA2VA(PIMAGE_IMPORT_BY_NAME, base, oft->u1.AddressOfData);
++            if (_strcmp((const char*)ibn->Name, target) != 0) continue;
++            if (ft->u1.Function == (ULONG_PTR)stub) continue;
++            if (inst->api.VirtualProtect(&ft->u1.Function, sizeof(ULONG_PTR), PAGE_READWRITE, &old)) {
++                ft->u1.Function = (ULONG_PTR)stub;
++                inst->api.VirtualProtect(&ft->u1.Function, sizeof(ULONG_PTR), old, &old);
++            }
++        }
++    }
++}
++
++static void hook_cxx_module_base(PDONUT_INSTANCE inst, PVOID cs, PIMAGE_NT_HEADERS nt) {
++    PPEB                    peb;
++    PPEB_LDR_DATA           ldr;
++    PLDR_DATA_TABLE_ENTRY   dte;
++    PIMAGE_DOS_HEADER       dos;
++    PIMAGE_NT_HEADERS       mnt;
++    PVOID                   orig, stub;
++    char                    api[20], modname[12];
++    HMODULE                 ntdll;
++
++    name_rtlpctofileheader(api);
++    // Kernel32 exports a thunk through an IAT slot that the traversal below
++    // can replace. Saving that thunk makes the fallback recurse into our own
++    // stub for every non-payload address (including DXGI initialization).
++    // Resolve the implementation in its owning module, not the forwarding thunk.
++    name_ntdll(modname);
++    ntdll = inst->api.GetModuleHandleA(modname);
++    orig = (ntdll != NULL) ? (PVOID)inst->api.GetProcAddress(ntdll, api) : NULL;
++    if (orig == NULL) return;
++
++    stub = make_pc2f_stub(inst, (ULONG_PTR)cs,
++                          (ULONG_PTR)cs + nt->OptionalHeader.SizeOfImage, orig);
++    if (stub == NULL) return;
++
++    // Every loaded module that imports the function (vcruntime140[_1] for /MD,
++    // and any other CRT a payload may use).
++    peb = (PPEB)NtCurrentTeb()->ProcessEnvironmentBlock;
++    ldr = (PPEB_LDR_DATA)peb->Ldr;
++    for (dte = (PLDR_DATA_TABLE_ENTRY)ldr->InLoadOrderModuleList.Flink;
++         dte->DllBase != NULL;
++         dte = (PLDR_DATA_TABLE_ENTRY)dte->InLoadOrderLinks.Flink) {
++        // The implementation's own imports must remain outside interception.
++        if (dte->DllBase == (PVOID)ntdll) continue;
++        dos = (PIMAGE_DOS_HEADER)dte->DllBase;
++        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
++        mnt = RVA2VA(PIMAGE_NT_HEADERS, dte->DllBase, dos->e_lfanew);
++        if (mnt->Signature != IMAGE_NT_SIGNATURE) continue;
++        patch_pc2f_module(inst, dte->DllBase,
++            mnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub);
++    }
++
++    // The payload image is not in that list; patch its own IAT too (/MT).
++    patch_pc2f_module(inst, cs,
++        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub);
++}
++#endif
++
+ // for setting the command line...
+ typedef CHAR**  (WINAPI *p_acmdln_t)(VOID);
+ typedef WCHAR** (WINAPI *p_wcmdln_t)(VOID);
+@@ -304,9 +458,12 @@
+         
+         dll = xGetLibAddress(inst, name);
+         
+-        // Resolve the API for this library
+-        oft = RVA2VA(PIMAGE_THUNK_DATA, cs, imp->OriginalFirstThunk);
++        // Resolve the API for this library. Some linkers emit an import
++        // descriptor with no lookup table; the lookup then lives in the IAT
++        // itself, which is the standard fallback.
+         ft  = RVA2VA(PIMAGE_THUNK_DATA, cs, imp->FirstThunk);
++        oft = imp->OriginalFirstThunk ?
++                RVA2VA(PIMAGE_THUNK_DATA, cs, imp->OriginalFirstThunk) : ft;
+           
+         // For each API
+         for (;; oft++, ft++) {
+@@ -349,7 +506,11 @@
+         dll = xGetLibAddress(inst, name);
+         
+         if(dll == NULL) continue;
+-        
++
++        // No name table means the delay imports are already resolved by
++        // address; there is nothing to look up.
++        if(del->ImportNameTableRVA == 0) continue;
++
+         // Resolve the API for this library
+         oft = RVA2VA(PIMAGE_THUNK_DATA, cs, del->ImportNameTableRVA);
+         ft  = RVA2VA(PIMAGE_THUNK_DATA, cs, del->ImportAddressTableRVA);
+@@ -402,31 +563,49 @@
+     }
+ 
+     if (inst->decoy[0] == 0) {
++      PVOID first_base = cs;
++
+       DPRINT("Unmapping temporary local view of section to persist changes.");
+       status = inst->api.NtUnmapViewOfSection(inst->api.GetCurrentProcess(), cs);
+       DPRINT("NTSTATUS: %d", status);
+       if(status != 0) return;
+ 
+-      // if no reloc information is present, make sure we use the preferred address
+-      if (has_reloc) {
+-        DPRINT("No relocation information present, so using preferred address...");
+-        cs = NULL;
+-      }
++      // Request the same base for the final view. Relocations and IAT entries
++      // were fixed up against first_base; asking the system to choose could hand
++      // back a different address and leave every adjusted pointer pointing at the
++      // old one. Passing the address back is a hint to preserve, not a fresh
++      // allocation: an explicit base either maps exactly there or fails.
++      cs = first_base;
+       viewSize = 0;
+ 
+-      DPRINT("Mapping writecopy local view of section to execute PE.");
+-      status = inst->api.NtMapViewOfSection(hSection, inst->api.GetCurrentProcess(), &cs, 0, 0, 0, &viewSize, ViewUnmap, 0, PAGE_EXECUTE_WRITECOPY);
++      // Map the final view PAGE_EXECUTE_READWRITE, then narrow per section below.
++      //
++      // A view's protection can be narrowed but not widened afterwards: measured
++      // on Windows 11 26200, a PAGE_EXECUTE_WRITECOPY view rejects PAGE_READWRITE
++      // and a PAGE_READWRITE view rejects PAGE_EXECUTE_READ, both with
++      // ERROR_INVALID_PARAMETER, while an RWX view accepts both directions.
++      // The static CRT aborts before main on a WRITECOPY view because its winapi
++      // thunk initialiser cannot make .fptable writable. Mapping RWX and then
++      // applying each section's rights (including the padding before the next
++      // section, which stays inside numBytes) keeps the final image free of RWX
++      // padding, which is what WRITECOPY was there to achieve.
++      DPRINT("Mapping read-write-execute local view of section, narrowed per section.");
++      status = inst->api.NtMapViewOfSection(hSection, inst->api.GetCurrentProcess(), &cs, 0, 0, 0, &viewSize, ViewUnmap, 0, PAGE_EXECUTE_READWRITE);
+       DPRINT("View size: %lld", viewSize);
+       DPRINT("NTSTATUS: %d", status);
+       if(status != 0) return;
+ 
+       DPRINT("Mapped to address: %p", cs);
++      if (cs != first_base) {
++        DPRINT("Section mapped at %p, not at the relocated base %p; refusing to run", cs, first_base);
++        return;
++      }
+     }
+ 
+-    // start everything out as WC
+-    // this is because some sections are padded and you can end up with extra RWX memory if you don't pre-mark the padding as WC
+-    DPRINT("Pre-marking module as WC to avoid padding between PE sections staying RWX.")
+-    inst->api.VirtualProtect(cs, viewSize, PAGE_WRITECOPY, &oldprot);
++    // The view starts RWX; the per-section pass below narrows every byte of it,
++    // including the padding between sections, so no RWX region survives.
++    DPRINT("Pre-marking module as RWX; per-section pass narrows it.")
++    inst->api.VirtualProtect(cs, viewSize, PAGE_EXECUTE_READWRITE, &oldprot);
+ 
+     DPRINT("Setting permissions for each PE section");
+     // done with binary manipulation, mark section permissions appropriately
+@@ -437,15 +616,16 @@
+       BOOL isExecute = (shcp[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ? TRUE : FALSE;
+ 
+       if (isWrite & isExecute)
+-        continue; // do nothing, already WCX
++      {
++        // The final view is RW, so a RWX section has to be made executable again;
++        // the decoy path maps a write-copy view and already has WCX.
++        newprot = (inst->decoy[0] == 0) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_WRITECOPY;
++      }
+       else if (isRead & isExecute)
+           newprot = PAGE_EXECUTE_READ;
+       else if (isRead & isWrite & !isExecute)
+       {
+-        if (inst->decoy[0] == 0)
+-          newprot = PAGE_WRITECOPY; // must use WC because RW is incompatible with permissions of initial view (WCX)
+-        else
+-          newprot = PAGE_READWRITE;
++        newprot = (inst->decoy[0] == 0) ? PAGE_READWRITE : PAGE_WRITECOPY;
+       }
+       else if (!isRead & !isWrite & isExecute)
+           newprot = PAGE_EXECUTE;
+@@ -477,22 +657,77 @@
+ 
+     inst->api.VirtualProtect(cs, ntc.OptionalHeader.BaseOfCode, PAGE_READONLY, &oldprot);
+ 
+-    /** 
+-      Execute TLS callbacks. These are only called when the process starts, not when a thread begins, ends
+-      or when the process ends. TLS is not fully supported.
++    // Let x64 C++ exception handling identify this image as the throwing module.
++    // The 32-bit CRT does not use RtlPcToFileHeader for this; its own failure
++    // (STATUS_INVALID_DISPOSITION) has a different, unattributed cause.
++    #ifdef _WIN64
++      hook_cxx_module_base(inst, cs, &ntc);
++    #endif
++
++#ifdef _WIN64
++    // Register the exception table with the unwinder.
++    //
++    // C++ exceptions and SEH in a manually mapped image need RUNTIME_FUNCTION
++    // entries; without this the unwind finds no handler and the exception
++    // escapes the payload. The call is resolved dynamically so the instance
++    // layout and the pre-resolved API list stay as they are.
++    // Read the directory from ntc, the copy taken before the headers were wiped:
++    // ntnew points into the mapped headers, which are zero by this point when the
++    // caller asked for the default (headers overwritten).
++    rva  = ntc.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
++    size = ntc.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
++    if(rva != 0 && size >= sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)) {
++      typedef BOOLEAN (NTAPI *RtlAddFunctionTable_t)(PIMAGE_RUNTIME_FUNCTION_ENTRY, DWORD, ULONG_PTR);
++      RtlAddFunctionTable_t _RtlAddFunctionTable;
++      HMODULE ntdll;
++      char    modname[24];
++      char    apiname[24];
++
++      DPRINT("Registering exception table at %p, %u entries",
++        RVA2VA(PVOID, cs, rva), (DWORD)(size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)));
++
++      // The instance only carries the ntdll name when bypassing was requested.
++      name_ntdll(modname);
++      ntdll = inst->api.GetModuleHandleA(modname);
++      name_rtladdfunctiontable(apiname);
++      _RtlAddFunctionTable = (RtlAddFunctionTable_t)inst->api.GetProcAddress(ntdll, apiname);
++      if(_RtlAddFunctionTable != NULL) {
++        if(!_RtlAddFunctionTable((PIMAGE_RUNTIME_FUNCTION_ENTRY)RVA2VA(PVOID, cs, rva),
++                                 (DWORD)(size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)),
++                                 (ULONG_PTR)cs)) {
++          DPRINT("RtlAddFunctionTable failed: %d", inst->api.GetLastError());
++        }
++      }
++    }
++#endif
++
++    /**
++      Process the TLS directory.
++
++      The OS loader assigns the module a *static* TLS index, writes it to
++      AddressOfIndex, and for every thread copies the template into the slot the
++      compiler reads: TEB.ThreadLocalStoragePointer[index] (gs:[58h] on x64,
++      fs:[2Ch] on x86). A manual mapper has no public way to allocate one of
++      those indices. TlsAlloc allocates from the *dynamic* namespace instead: the
++      same number in the static array can already hold another module's block, so
++      using it overwrote kernelbase's TLS and crashed the CRT. Claiming a slot
++      that is NULL in this thread's static array was also tried and lost the slot
++      to a later, lazy allocation. Thread-local variables therefore remain
++      unsupported; Compat reports that. TLS callbacks do run, but only for
++      DLL_PROCESS_ATTACH.
+     */
+-    rva = ntnew->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
++    rva = ntc.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+     if(rva != 0) {
+       DPRINT("Processing TLS directory");
+-      
++
+       tls = RVA2VA(PIMAGE_TLS_DIRECTORY, cs, rva);
+-      
++
+       // address of callbacks is absolute. requires relocation information
+       callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
+       DPRINT("AddressOfCallBacks : %p", callbacks);
+-      
++
+       // DebugBreak();
+-      
++
+       if(callbacks) {
+         while(*callbacks != NULL) {
+           // call function
