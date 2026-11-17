@@ -81,11 +81,20 @@ The development tests are not included in this minimal distribution.
 ```text
 donut/                 Public API, PE inspection, encoding, compression, loaders
 internal/ntcompress/   Windows compression support required by the library
-native/                Native-loader source modification patch
+native/                Native-loader source modification patch and rebuild workspace
+upstream/              Archived upstream donut sources and stock loader stubs (inert)
 go.mod                 Go module declaration
 LICENSE                BSD 3-Clause license and upstream attribution
 README.md              Project documentation
 ```
+
+`upstream/` keeps a byte-verified copy of upstream donut v1.02 — including the
+original authors' stock loader stubs — plus a snapshot of the enhanced loader
+source, so the loader can be rebuilt without an external checkout. Each archived
+directory has its own `go.mod`, which makes the Go tool ignore the subtree: none
+of it is compiled into or shipped with this library. See
+[upstream/README.md](upstream/README.md) for contents, provenance, and the
+verified rebuild procedure.
 
 The generated loader arrays are in `donut/zz_loader_blobs_enhanced.go`.
 `native/loader-enhance.patch` records the modifications against Donut 1.1; it is

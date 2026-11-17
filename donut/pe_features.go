@@ -26,6 +26,10 @@ const (
 const (
 	// IMAGE_LOAD_CONFIG_DIRECTORY64.GuardFlags.
 	loadCfg64GuardFlags = 144
+	// IMAGE_LOAD_CONFIG_DIRECTORY32.GuardFlags. The 32-bit layout packs the
+	// pointer fields as 4-byte values, so GuardFlags lands much earlier than in
+	// the 64-bit layout; offset 144 there is GuardRFVerifyStackPointerFunctionPointer.
+	loadCfg32GuardFlags = 88
 	// IMAGE_GUARD_CF_FUNCTION_TABLE_PRESENT.
 	imageGuardCFTablePresent = 0x00000400
 
@@ -43,6 +47,14 @@ const (
 	tls64AddressOfIndex        = 16
 	tls64AddressOfCallBacks    = 24
 	tls64SizeOfZeroFill        = 32
+
+	// IMAGE_TLS_DIRECTORY32 field offsets. The pointer fields are 4 bytes, so
+	// SizeOfZeroFill lands at 20 rather than 32.
+	tls32StartAddressOfRawData = 0
+	tls32EndAddressOfRawData   = 4
+	tls32AddressOfIndex        = 8
+	tls32AddressOfCallBacks    = 12
+	tls32SizeOfZeroFill        = 20
 )
 
 // directory returns the (rva, size) pair for one data directory entry.

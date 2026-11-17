@@ -59,6 +59,8 @@ type Config struct {
 	// Method names the DLL export to call after its DllMain. Empty, the default,
 	// means "initialise the DLL and stop there". It is verified against the export
 	// table, case sensitively, so a typo fails at Build rather than on the target.
+	// A name longer than MaxNameLen is refused (ErrMethodNameTooLong): the loader
+	// resolves the export by the stored name, which would otherwise be truncated.
 	// EXE modules ignore it, as donut does.
 	Method string
 
@@ -182,12 +184,24 @@ func Build(cfg Config) ([]byte, error) {
 	// the export table and matching the name exactly; checking here turns a typo
 	// into a build error instead of a crash on the target.
 	if info.Type == ModuleDLL && cfg.Method != "" {
+		// The stored name is cut to the field width, but the loader resolves the
+		// export by that stored name. A name longer than the field would pass the
+		// export check below yet be truncated on the way in, so the loader would
+		// look up a name the image does not export. Refuse it here instead.
+		if len(cfg.Method) > MaxNameLen {
+			return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrMethodNameTooLong, len(cfg.Method), MaxNameLen)
+		}
 		pe, err := parsePE(cfg.Payload)
 		if err != nil {
 			return nil, err
 		}
 		if !hasExport(cfg.Payload, pe, cfg.Method) {
 			return nil, ErrDLLFunction
+		}
+		// A forwarder's RVA is a string, not code; the loader calls exports by
+		// address and would jump into it. Refuse rather than emit broken shellcode.
+		if isForwardedExport(cfg.Payload, pe, cfg.Method) {
+			return nil, fmt.Errorf("%w: %s", ErrForwardedExport, cfg.Method)
 		}
 	}
 	// A DLL's parameters are delivered as its export's single argument, so a

@@ -146,10 +146,12 @@ const (
 )
 
 // Field widths inside DONUT_MODULE. These are donut's own limits, measured against
-// a donut binary rather than inferred. Values longer than the limit are truncated
-// by Build exactly as the C generator truncates them, so an over-long input does
-// not fail but does lose bytes; Config.TruncatedFields reports which fields will be
-// cut before that happens.
+// a donut binary rather than inferred. An over-long Args is truncated by Build
+// exactly as the C generator truncates it, so it does not fail but does lose bytes;
+// Config.TruncatedFields reports which fields will be cut before that happens.
+// Method is the exception: an over-long export name is refused with
+// ErrMethodNameTooLong, because the loader resolves the export by the stored
+// (truncated) name and would otherwise build shellcode that cannot find it.
 const (
 	// MaxNameLen is the width donut gives a DLL export name.
 	MaxNameLen = maxName - 1
@@ -183,6 +185,15 @@ var (
 	// ErrDLLParam means parameters were given for a DLL without an export to
 	// receive them.
 	ErrDLLParam = errors.New("donut: parameters for a DLL require Method to name an export")
+	// ErrMethodNameTooLong means Config.Method exceeds the encoded field width.
+	// The loader resolves the export by the stored (truncated) name, so a name
+	// that does not fit would build but never resolve on the target; Build refuses
+	// it instead.
+	ErrMethodNameTooLong = errors.New("donut: DLL export name exceeds the encoded field width")
+	// ErrForwardedExport means Config.Method names a forwarded export. Its RVA is
+	// a "DLL.Func" string inside the export directory, not code, and the loader
+	// calls exports by address, so it would jump into that string.
+	ErrForwardedExport = errors.New("donut: the named DLL export is a forwarder, not callable by address")
 
 	// ErrIncompatiblePayload is returned by Build when Config.Strict is set and
 	// Compat found a blocker. The message lists the blockers verbatim.
