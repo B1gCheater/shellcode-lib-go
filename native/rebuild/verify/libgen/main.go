@@ -20,6 +20,7 @@ func main() {
 	method := flag.String("method", "", "DLL export")
 	args := flag.String("args", "", "arguments")
 	entropy := flag.Int("entropy", donut.EntropyNone, "1=none 2=random 3=default")
+	compress := flag.Int("compress", donut.CompressNone, "1=none 2=aplib 3=lznt1 4=xpress")
 	flag.Parse()
 	if *in == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "need -in and -out")
@@ -37,6 +38,7 @@ func main() {
 	cfg.Method = *method
 	cfg.Args = *args
 	cfg.Entropy = *entropy
+	cfg.Compress = *compress
 	cfg.Bypass = donut.BypassNone
 	cfg.Headers = donut.HeadersKeep
 	cfg.ExitOpt = donut.ExitThread
@@ -44,8 +46,8 @@ func main() {
 	pic, err := donut.Build(cfg)
 	must(err)
 	must(os.WriteFile(*out, pic, 0o644))
-	fmt.Printf("libgen: wrote %d bytes to %s (arch=%s method=%q entropy=%d)\n",
-		len(pic), *out, *arch, *method, *entropy)
+	fmt.Printf("libgen: wrote %d bytes to %s (arch=%s method=%q entropy=%d compress=%d)\n",
+		len(pic), *out, *arch, *method, *entropy, *compress)
 }
 
 func must(err error) {

@@ -267,6 +267,132 @@ BOOL SetCommandLineW(PDONUT_INSTANCE inst, PCWSTR NewCommandLine);
 BOOL IsExitAPI(PDONUT_INSTANCE inst, PCHAR name);
 BOOL CheckForILOnly(PIMAGE_NT_HEADERS nthost, ULONG_PTR host);
 
+// Resolve a forwarded export ("DLL.Func") through its target module. The OS
+// loader does this transparently; a manual mapper that calls exports by address
+// would otherwise jump into the forwarder string. Returns NULL when the target
+// module is not loaded in the host or the function is missing.
+static PVOID resolve_forwarder(PDONUT_INSTANCE inst, PCHAR fwd) {
+    PCHAR   dot;
+    CHAR    modname[64];
+    INT     i, len;
+    HMODULE m;
+    PVOID   fn;
+
+    if(fwd == NULL) return NULL;
+
+    // Locate the separator between the module and the function.
+    dot = NULL;
+    for(i = 0; fwd[i] != 0 && i < 63; i++) {
+        if(fwd[i] == '.') { dot = &fwd[i]; break; }
+    }
+    if(dot == NULL || dot == fwd) return NULL;   // no separator, or empty module
+    len = (INT)(dot - fwd);
+    if(len >= 63) return NULL;
+    for(i = 0; i < len; i++) modname[i] = fwd[i];
+    modname[len] = 0;
+
+    m = inst->api.GetModuleHandleA(modname);
+    if(m == NULL) {
+        // Forwarders usually name the module without its extension ("msvcrt"),
+        // but GetModuleHandle wants the full name. Append ".dll" and retry.
+        if(len + 4 >= 63) return NULL;
+        modname[len]     = '.';
+        modname[len + 1] = 'd';
+        modname[len + 2] = 'l';
+        modname[len + 3] = 'l';
+        modname[len + 4] = 0;
+        m = inst->api.GetModuleHandleA(modname);
+        if(m == NULL) return NULL;
+    }
+
+    fn = inst->api.GetProcAddress(m, dot + 1);
+    return fn;
+}
+
+#ifdef _WIN64
+// --- Static TLS registration (x64 only) -------------------------------------
+//
+// A manually mapped module with a static TLS template needs a *static* TLS index
+// allocated by the loader: the compiler emits direct indexing into
+// TEB.ThreadLocalStoragePointer[index], and no exported API allocates one (TlsAlloc
+// covers the separate dynamic array). ntdll's internal LdrpHandleTlsData does what
+// the OS loader does -- allocates an index, writes AddressOfIndex, copies the
+// template into the current thread's slot, and registers the module in LdrpTlsList
+// so threads created later get their copy too. It is not exported, so it is found
+// by a byte signature inside ntdll's mapped image. When the signature is absent
+// (an unrecognised build) registration is skipped and the module runs with the
+// same degraded TLS behaviour as before. The loader lock is not taken here: the
+// common case runs on a single thread, and this matches the mapping philosophy of
+// the rest of the loader.
+
+// Fill a stack buffer with the x64 prologue signature of LdrpHandleTlsData
+// (Windows 10 21H2/22H2). Byte stores cannot be folded into .rdata, so the
+// signature ships entirely in .text like every other literal in this loader.
+static void fill_ldrp_tls_pattern(volatile unsigned char *p) {
+    p[0]=0x48; p[1]=0x89; p[2]=0x5C; p[3]=0x24; p[4]=0x10;
+    p[5]=0x48; p[6]=0x89; p[7]=0x74; p[8]=0x24; p[9]=0x18;
+    p[10]=0x48; p[11]=0x89; p[12]=0x7C; p[13]=0x24; p[14]=0x20;
+    p[15]=0x41; p[16]=0x54; p[17]=0x41; p[18]=0x56; p[19]=0x41; p[20]=0x57;
+    p[21]=0x48; p[22]=0x81; p[23]=0xEC; p[24]=0x00; p[25]=0x01; p[26]=0x00; p[27]=0x00;
+}
+
+// Scan ntdll's mapped image for the LdrpHandleTlsData signature and return the
+// matching address, or NULL when the build is not recognised.
+static PVOID find_ldrp_handle_tls_data(PDONUT_INSTANCE inst) {
+    PIMAGE_DOS_HEADER dos;
+    PIMAGE_NT_HEADERS nt;
+    HMODULE           ntdll;
+    char              modname[12];
+    unsigned char     pat[28];
+    PBYTE             img, end, p;
+    DWORD             imgSize, i;
+
+    name_ntdll(modname);
+    ntdll = inst->api.GetModuleHandleA(modname);
+    if(ntdll == NULL) return NULL;
+
+    fill_ldrp_tls_pattern(pat);
+
+    dos = (PIMAGE_DOS_HEADER)ntdll;
+    nt  = RVA2VA(PIMAGE_NT_HEADERS, ntdll, dos->e_lfanew);
+    if(nt->Signature != IMAGE_NT_SIGNATURE) return NULL;
+
+    imgSize = nt->OptionalHeader.SizeOfImage;
+    img = (PBYTE)ntdll;
+    end = img + imgSize - sizeof(pat);
+
+    for(p = img; p < end; p++) {
+      for(i = 0; i < sizeof(pat); i++) {
+        if(p[i] != pat[i]) break;
+      }
+      if(i == sizeof(pat)) return (PVOID)p;
+    }
+    return NULL;
+}
+
+// Hand a synthetic LDR_DATA_TABLE_ENTRY (only DllBase set, the rest zero -- which
+// is all LdrpHandleTlsData needs) to LdrpHandleTlsData. The entry is intentionally
+// leaked: LdrpTlsList keeps referencing it so threads created later still receive
+// their TLS block. Returns FALSE only when the entry cannot be allocated.
+static BOOL register_static_tls(PDONUT_INSTANCE inst, PVOID cs, PVOID fn) {
+    typedef void (NTAPI *LdrpHandleTlsData_t)(PVOID LdrEntry);
+    LdrpHandleTlsData_t f = (LdrpHandleTlsData_t)fn;
+    PBYTE entry;
+
+    entry = (PBYTE)inst->api.VirtualAlloc(NULL, 0x200,
+      MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if(entry == NULL) return FALSE;
+
+    Memset(entry, 0, 0x200);
+    // LDR_DATA_TABLE_ENTRY.DllBase is at offset 0x30 on x64.
+    *(PVOID*)(entry + 0x30) = cs;
+
+    DPRINT("Registering static TLS for %p via LdrpHandleTlsData", cs);
+    f((PVOID)entry);
+    return TRUE;
+}
+#endif
+
 // In-Memory execution of unmanaged DLL file. YMMV with EXE files requiring subsystem..
 VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     PIMAGE_DOS_HEADER           dos, doshost;
@@ -283,7 +409,7 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     PIMAGE_RELOC                list;
     PIMAGE_BASE_RELOCATION      ibr;
     IMAGE_NT_HEADERS            ntc;
-    DWORD                       rva, size;
+    DWORD                       rva, size, fwd_rva, exp_size;
     PDWORD                      adr;
     PDWORD                      sym;
     PWORD                       ord;
@@ -309,6 +435,9 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     PVOID                       cs = NULL;
     SIZE_T                      viewSize = 0;
     BOOL                        has_reloc;
+    BOOL                        dll_attached = FALSE;
+    BOOL                        tls_attached = FALSE;
+    PIMAGE_TLS_CALLBACK         *tls_cbs = NULL;
 #ifdef _WIN64
     PC2F_HOOK                   cxx_hook;
     PVOID                       ft_table = NULL;   // registered RUNTIME_FUNCTION table
@@ -604,6 +733,29 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     // copy relevant headers before they are wiped
     ntc = *nt;
 
+#ifdef _WIN64
+    // Static TLS must be registered while the headers are still readable:
+    // LdrpHandleTlsData walks the image from DllBase to find the TLS directory,
+    // and the header wipe below removes it. This is the one loader service that
+    // cannot be reproduced without ntdll internals, so it is x64-only and
+    // best-effort; a payload with no static TLS template is left alone.
+    {
+      DWORD tls_rva = ntc.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+      if(tls_rva != 0) {
+        tls = RVA2VA(PIMAGE_TLS_DIRECTORY, cs, tls_rva);
+        if(tls->StartAddressOfRawData != tls->EndAddressOfRawData ||
+           tls->SizeOfZeroFill != 0) {
+          PVOID tls_fn = find_ldrp_handle_tls_data(inst);
+          if(tls_fn != NULL) {
+            register_static_tls(inst, cs, tls_fn);
+          } else {
+            DPRINT("LdrpHandleTlsData not found; static TLS remains unregistered");
+          }
+        }
+      }
+    }
+#endif
+
     shcp = inst->api.VirtualAlloc(NULL, ntc.FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER), 
       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
@@ -800,12 +952,14 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
       // DebugBreak();
 
       if(callbacks) {
+        tls_cbs = callbacks;
         while(*callbacks != NULL) {
           // call function
           DPRINT("Calling %p", *callbacks);
           (*callbacks)((LPVOID)cs, DLL_PROCESS_ATTACH, NULL);
           callbacks++;
         }
+        tls_attached = TRUE;
       }
     }
 
@@ -818,7 +972,14 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
         DllMain = RVA2VA(DllMain_t, cs, ntc.OptionalHeader.AddressOfEntryPoint);
         DPRINT("Executing entrypoint of DLL: %p", (PVOID)DllMain);
         DPRINT("HINSTANCE: %p\n\n", (PVOID)cs);
-        DllMain(cs, DLL_PROCESS_ATTACH, NULL);
+        dll_attached = DllMain(cs, DLL_PROCESS_ATTACH, NULL);
+        if(!dll_attached) {
+          // The OS loader aborts a load whose DllMain refuses DLL_PROCESS_ATTACH:
+          // no export is called and no DLL_PROCESS_DETACH is delivered. Mirror
+          // that instead of running a module that declared itself unready.
+          DPRINT("DllMain refused DLL_PROCESS_ATTACH; aborting load");
+          goto pe_cleanup;
+        }
       } else {
         DPRINT("DLL has no entry point; skipping DllMain");
       }
@@ -847,10 +1008,26 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
             do {
               str = RVA2VA(PCHAR, cs, sym[cnt-1]);
               if(!_strcmp(str, mod->method)) {
-                DllParam = RVA2VA(DllParam_t, cs, adr[ord[cnt-1]]);
+                fwd_rva = adr[ord[cnt-1]];
+                DllParam = RVA2VA(DllParam_t, cs, fwd_rva);
                 break;
               }
             } while (--cnt);
+
+            // A forwarder's function RVA points inside the export directory, at
+            // a "DLL.Func" string rather than at code. Resolve it through the
+            // target module so a re-exported function still works. If the target
+            // is not loaded in the host the load cannot proceed.
+            if(DllParam != NULL) {
+              exp_size = ntc.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+              if(fwd_rva >= rva && (exp_size == 0 || fwd_rva < rva + exp_size)) {
+                DllParam = (DllParam_t)resolve_forwarder(inst, (PCHAR)DllParam);
+                if(DllParam == NULL) {
+                  DPRINT("Unable to resolve forwarded export %s", mod->method);
+                  goto pe_cleanup;
+                }
+              }
+            }
       
             // resolved okay?
             if(DllParam != NULL) {
@@ -911,6 +1088,25 @@ VOID RunPE(PDONUT_INSTANCE inst, PDONUT_MODULE mod) {
     }
 
 pe_cleanup:
+    // A DLL whose DllMain accepted DLL_PROCESS_ATTACH gets its DLL_PROCESS_DETACH
+    // before the image is unmapped, so it can release resources, flush buffers
+    // and run CRT atexit handlers. The OS loader does exactly this on FreeLibrary;
+    // skipping it leaks whatever the detach path would have cleaned up.
+    if(mod->type == DONUT_MODULE_DLL && dll_attached && cs != NULL) {
+      DllMain(cs, DLL_PROCESS_DETACH, NULL);
+      dll_attached = FALSE;
+    }
+
+    // TLS callbacks receive DLL_PROCESS_DETACH symmetrically with attach.
+    if(tls_attached && tls_cbs != NULL && cs != NULL) {
+      callbacks = tls_cbs;
+      while(*callbacks != NULL) {
+        DPRINT("Calling TLS DETACH callback %p", *callbacks);
+        (*callbacks)((LPVOID)cs, DLL_PROCESS_DETACH, NULL);
+        callbacks++;
+      }
+      tls_attached = FALSE;
+    }
 #ifdef _WIN64
     // Undo the exception-table registration and the C++ module-base hook before
     // the image goes away, so the host is left as it was found. Order matters:

@@ -24,6 +24,7 @@ func main() {
 	out := flag.String("out", "", "output prefix")
 	arch := flag.String("arch", "x64", "x64 or x86")
 	method := flag.String("method", "", "DLL export to call")
+	args := flag.String("args", "", "argument string to pass")
 	rebuilt := flag.String("rebuilt", "", "rebuilt loader blob file (raw .text)")
 	flag.Parse()
 
@@ -44,6 +45,7 @@ func main() {
 	cfg.ExitOpt = donut.ExitThread
 	cfg.Compress = donut.CompressNone
 	cfg.Method = *method
+	cfg.Args = *args
 
 	x64 := *arch == "x64"
 	if x64 {

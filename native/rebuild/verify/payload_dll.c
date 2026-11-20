@@ -8,6 +8,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         printf("PAYLOAD_DLL attach\n");
         fflush(stdout);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        printf("PAYLOAD_DLL detach\n");
+        fflush(stdout);
     }
     return TRUE;
 }

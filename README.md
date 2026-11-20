@@ -14,7 +14,7 @@ the upstream loader. This is not a drop-in replacement for the Windows loader.
 - No third-party Go dependencies or cgo requirement.
 - Generation can be built on Windows, Linux, and macOS. Generated code targets
   Windows x86 or x64; it is not executable on Linux or macOS.
-- XPRESS generation requires Windows. LZNT1 generation is portable.
+- XPRESS generation requires Windows. LZNT1 and aPLib generation are portable.
 
 ## Package API
 
@@ -33,8 +33,9 @@ helpers are retained for existing callers. No CLI or execution runner is include
 
 Supported inputs are native EXE and DLL images. Managed assemblies, scripts,
 network staging, and the upstream original-entry-point option are not supported.
-Compression supports uncompressed input, LZNT1, and Windows-host XPRESS; aPLib
-generation is not implemented.
+Compression supports uncompressed input, LZNT1, aPLib, and Windows-host XPRESS.
+LZNT1 and aPLib use portable pure-Go encoders; aPLib is expanded by the loader's
+own `aP_depack`.
 
 `DefaultConfig` retains the development library's existing defaults, including
 its security-bypass policy and header handling. Review every configuration field
@@ -57,16 +58,31 @@ programs, execution helpers, and experimental artifacts. Consequently,
 
 The loader does not reproduce all operating-system loader services. In particular:
 
-- Static TLS variables are not fully supported; running TLS callbacks does not
-  establish full TLS compatibility.
+- Static TLS variables are supported on x64 only, and best-effort: the loader
+  locates ntdll's unexported `LdrpHandleTlsData` by a build-specific byte
+  signature, so an unrecognised Windows build silently skips registration and
+  falls back to the degraded behaviour. x86 static TLS remains unsupported.
 - x86 C++ exception handling remains unsupported.
-- Load-configuration metadata and DLL lifecycle notifications are not fully
-  implemented. A compatibility report without blockers does not prove safe
-  execution, unloading, or host-process isolation.
+- Load-configuration metadata is not fully implemented. A compatibility report
+  without blockers does not prove safe execution, unloading, or host-process
+  isolation.
 - Input headers and data must be treated as untrusted. Parsing and compatibility
   inspection do not establish that an image is safe to execute.
 - Applications must validate their own dependencies, process-wide state,
   callbacks, and shutdown behavior.
+
+DLL lifecycle is modelled on the OS loader where it is observable:
+
+- `DllMain` receives `DLL_PROCESS_ATTACH` before the export and, when it returns
+  `TRUE`, `DLL_PROCESS_DETACH` before the image is unmapped. A `DllMain` that
+  refuses `DLL_PROCESS_ATTACH` aborts the load: the export is not called and no
+  `DETACH` is delivered, matching `LoadLibrary`.
+- TLS callbacks run for both `DLL_PROCESS_ATTACH` and `DLL_PROCESS_DETACH`.
+- Forwarded exports (`"DLL.Func"`) are resolved through their target module at
+  run time instead of being refused; the target must be loaded in the host.
+- Threads the payload itself creates do not receive `DLL_THREAD_ATTACH` /
+  `DLL_THREAD_DETACH` (the image is not in the loader's module list); `Compat`
+  reports this as informational.
 
 In the development workspace, the current loader revision passed local Windows
 x86/x64 regression checks, including a system-module lookup outside the mapped

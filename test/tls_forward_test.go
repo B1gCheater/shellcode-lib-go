@@ -1,7 +1,6 @@
 package test
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/B1gCheater/shellcode-lib-go/donut"
@@ -81,21 +80,22 @@ func TestCompatReportsForwardedExport(t *testing.T) {
 		t.Fatalf("Compat: %v", err)
 	}
 	lvl, ok := issueLevel(issues, "forwarded_export")
-	if !ok || lvl != donut.CompatWarning {
-		t.Fatalf("forwarded export should be reported at warning, got ok=%v lvl=%v (%v)", ok, lvl, issues)
+	if !ok || lvl != donut.CompatInfo {
+		t.Fatalf("forwarded export should be reported at info (resolved at run time), got ok=%v lvl=%v (%v)", ok, lvl, issues)
 	}
 }
 
-func TestBuildRejectsForwardedMethod(t *testing.T) {
+// A forwarded Method must now build: the loader resolves it through the target
+// module at run time instead of jumping into the forwarder string.
+func TestBuildAcceptsForwardedMethod(t *testing.T) {
 	p := newSyntheticPE(false, true, 0x1000)
 	p.addForwardedExport("RunIt", "OTHERDLL.RealRun")
 	cfg := donut.DefaultConfig(p.data)
 	cfg.Arch = donut.ArchX64
 	cfg.Entropy = donut.EntropyNone
 	cfg.Method = "RunIt"
-	_, err := donut.Build(cfg)
-	if !errors.Is(err, donut.ErrForwardedExport) {
-		t.Fatalf("forwarded Method should return ErrForwardedExport, got %v", err)
+	if _, err := donut.Build(cfg); err != nil {
+		t.Fatalf("forwarded Method should now build (loader resolves it), got %v", err)
 	}
 }
 

@@ -31,7 +31,7 @@ Why each part matters:
 | `loader_exe_x86.go`, `loader_exe_x64.go` | The same stock stubs as Go arrays (`package donut`). This is why the nested `go.mod` is required — without it these files would be compiled into our own `donut` package. |
 | `loader/` | Native loader sources. `inmem_pe.c` is the file our patch modifies; `loader.c` includes it. `exe2h/` is the tool that extracts `.text` into the arrays. |
 | `include/` | Headers the loader and generator compile against, including `donut.h` (the `DONUT_INSTANCE` / `DONUT_MODULE` layouts our `instance.go` reproduces). |
-| `lib/` | aPLib static libraries (`aplib32/64.lib/.a`). Needed only to build upstream's own generator; our library does not implement aPLib packing. |
+| `lib/` | aPLib static libraries (`aplib32/64.lib/.a`). Needed only to build upstream's own generator; our library implements aPLib packing in portable Go (`donut/aplib.go`) and does not use these binaries. |
 | `donut.c`, `hash.c`, `encrypt.c`, `format.c`, `donutmodule.c` | Upstream generator, MARU hash, Chaskey cipher, output formats. The reference for our Go port's byte compatibility. |
 | `Makefile*`, `Dockerfile` | Upstream build recipes. `Makefile.msvc` shows the original `-Os` / `-Zp8` flags; `Makefile.mingw` shows the MinGW equivalents. |
 | `README.md`, `CHANGELOG.md`, `version-release-notes.txt` | Provenance: what upstream version this is and what it claimed to support. |
@@ -43,7 +43,7 @@ stubs in `donut/zz_loader_blobs_enhanced.go`, not these.
 
 | File | What it is |
 | --- | --- |
-| `loader/inmem_pe.c` | The enhanced loader source: upstream v1.02 plus `native/loader-enhance.patch`, plus the four later enhancements (entry-less DLL support, `RtlDeleteFunctionTable` on cleanup, IAT hook restore, stub-page free). |
+| `loader/inmem_pe.c` | The enhanced loader source: upstream v1.02 plus `native/loader-enhance.patch`, plus the later enhancements (entry-less DLL support, `RtlDeleteFunctionTable` on cleanup, IAT hook restore, stub-page free, `DLL_PROCESS_DETACH` delivery, `DllMain` return-value check, TLS detach callbacks, run-time forwarder resolution, and x64 static-TLS registration via `LdrpHandleTlsData`). |
 | `intrinsics.c` | Build shim. Modern GCC lowers large struct copies to `memcpy`/`memset` even at `-Os`; under `-nostdlib` those are undefined. This provides byte-loop implementations. Compile with `-fno-builtin` so GCC does not rewrite the bodies into recursive calls. |
 | `build.ps1` | The verified rebuild + verification-artefact script (also lives in `native/rebuild/verify/`). |
 | `blobgen.go.txt` | The generator for `donut/zz_loader_blobs_enhanced.go`. Stored with a `.txt` suffix so it is inert; the live copy is `native/rebuild/blobgen/main.go`. |

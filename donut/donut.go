@@ -40,9 +40,12 @@
 // sources with tools/loader-enhance.patch: static-CRT (/MT) payloads run, the
 // re-mapped view keeps the address the relocations were applied at, x64 exception
 // tables are registered (SEH works), x64 C++ exceptions are caught, and imports
-// without a lookup table fall back to the IAT. There is no loader selection knob;
-// README.md records what was changed and what still cannot work
-// (TLS variables, 32-bit C++ exceptions).
+// without a lookup table fall back to the IAT. DLLs get a faithful
+// DLL_PROCESS_ATTACH/DETACH pair (a refusing DllMain aborts the load), forwarded
+// exports are resolved through their target module, and x64 static TLS is
+// registered through ntdll's LdrpHandleTlsData (best-effort). There is no loader
+// selection knob; README.md records what was changed and what still cannot work
+// (x86 static TLS, 32-bit C++ exceptions).
 //
 // # Licence
 //
@@ -129,15 +132,13 @@ const (
 )
 
 // Payload compression engines for DONUT_MODULE.compress, matching donut's
-// wire values. CompressNone is the default. CompressLZNT1 goes through the
-// portable pure-Go encoder in lznt1.go, so it generates — byte-identically —
-// on every host; CompressXpress has no portable encoder and is answered by
-// ntdll's RtlCompressBuffer on Windows and refused elsewhere. Either way the
-// loader stub expands the result with RtlDecompressBuffer on the target, so
-// the wire format is exactly donut's.
-//
-// CompressAPLib is donut's third engine. It is named but never accepted: the
-// loader stub contains aP_depack, but no packer exists in this package.
+// wire values. CompressNone is the default. CompressLZNT1 and CompressAPLib go
+// through portable pure-Go encoders (lznt1.go, aplib.go), so they generate —
+// byte-identically — on every host; CompressXpress has no portable encoder and
+// is answered by ntdll's RtlCompressBuffer on Windows and refused elsewhere.
+// Either way the loader stub expands the result with RtlDecompressBuffer
+// (LZNT1/XPRESS) or aP_depack (aPLib) on the target, so the wire format is
+// exactly donut's.
 const (
 	CompressNone   = 1
 	CompressAPLib  = 2
@@ -190,9 +191,10 @@ var (
 	// that does not fit would build but never resolve on the target; Build refuses
 	// it instead.
 	ErrMethodNameTooLong = errors.New("donut: DLL export name exceeds the encoded field width")
-	// ErrForwardedExport means Config.Method names a forwarded export. Its RVA is
-	// a "DLL.Func" string inside the export directory, not code, and the loader
-	// calls exports by address, so it would jump into that string.
+	// ErrForwardedExport named a forwarded export whose RVA is a "DLL.Func"
+	// string, not code. It is retained for API compatibility but is no longer
+	// returned: the loader now resolves forwarders through their target module at
+	// run time (see Compat's CodeForwardedExport).
 	ErrForwardedExport = errors.New("donut: the named DLL export is a forwarder, not callable by address")
 
 	// ErrIncompatiblePayload is returned by Build when Config.Strict is set and
@@ -206,9 +208,8 @@ var (
 	ErrInvalidExit    = errors.New("donut: invalid exit option")
 	ErrRandom         = errors.New("donut: could not generate random values")
 	// ErrCompression reports a compression request this package cannot serve:
-	// an unknown engine, aPLib (not implemented), or a supported engine on a
-	// host where the generator cannot run (the encoder is Windows-only until
-	// the portable one lands).
+	// an unknown engine, or a supported engine on a host where the generator
+	// cannot run (XPRESS is Windows-only; LZNT1 and aPLib are portable).
 	ErrCompression = errors.New("donut: compression failed")
 	// ErrInvalidKeyMaterial reports pinned key material the loader could
 	// not verify, such as a signature containing a zero byte.

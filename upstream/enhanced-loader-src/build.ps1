@@ -54,6 +54,25 @@ try {
     & $gcc -m32 -shared payload_dll.c -o payload_dll32.dll
     if ($LASTEXITCODE -ne 0) { throw "dll32 build failed" }
 
+    # DLL that refuses DLL_PROCESS_ATTACH, and a DLL whose export is a forwarder
+    # to msvcrt.puts (exercises DllMain return check and forwarder resolution).
+    & $gcc -shared payload_dll_refuse.c -o payload_dll_refuse64.dll
+    if ($LASTEXITCODE -ne 0) { throw "refuse dll64 build failed" }
+    & $gcc -m32 -shared payload_dll_refuse.c -o payload_dll_refuse32.dll
+    if ($LASTEXITCODE -ne 0) { throw "refuse dll32 build failed" }
+
+    & $gcc -shared payload_forwarder.c payload_forwarder.def -o payload_forwarder64.dll
+    if ($LASTEXITCODE -ne 0) { throw "forwarder dll64 build failed" }
+    & $gcc -m32 -shared payload_forwarder.c payload_forwarder.def -o payload_forwarder32.dll
+    if ($LASTEXITCODE -ne 0) { throw "forwarder dll32 build failed" }
+
+    # DLL with a static TLS variable (__declspec(thread)): exercises the loader's
+    # LdrpHandleTlsData registration on x64. 32-bit static TLS is not supported.
+    & $gcc -shared payload_tls.c -o payload_tls64.dll
+    if ($LASTEXITCODE -ne 0) { throw "tls dll64 build failed" }
+    & $gcc -m32 -shared payload_tls.c -o payload_tls32.dll
+    if ($LASTEXITCODE -ne 0) { throw "tls dll32 build failed" }
+
     # generator
     & go build -o gen.exe "./gen"
     if ($LASTEXITCODE -ne 0) { throw "gen build failed" }

@@ -52,12 +52,12 @@ func (l CompatLevel) String() string {
 type CompatCode string
 
 const (
-	// CodeTLSNotAllocated: the image declares thread-local storage. The loader
-	// does not allocate a TLS index, so a __declspec(thread) variable that relies
-	// on being zero-initialised reads another module's slot instead. Measured: a
-	// counter that should reach 3 came back -2147483645. The TLS callbacks do run
-	// (the directory is read from the saved header copy); the index is what is
-	// missing.
+	// CodeTLSNotAllocated: the image declares a static TLS template. The x64
+	// loader now registers it through ntdll's LdrpHandleTlsData (best-effort:
+	// skipped if the build is not recognised); the x86 loader does not, so a
+	// __declspec(thread) / __thread variable reads another module's slot there.
+	// Kept at warning because the outcome depends on the target architecture and
+	// on an undocumented ntdll function, not on the payload alone.
 	CodeTLSNotAllocated CompatCode = "tls_index_not_allocated"
 
 	// CodeTLSCallbacksOnly: the TLS directory declares callbacks but no static
@@ -104,9 +104,18 @@ const (
 
 	// CodeForwardedExport: an export's function RVA points inside the export
 	// directory, which means it is a forwarder string ("OTHERDLL.Func") rather
-	// than code. The loader resolves exports by address and would jump into that
-	// string, so such an export cannot be called directly.
+	// than code. The loader now resolves the forwarder through its target module
+	// (GetModuleHandle + GetProcAddress), matching the OS loader, so it can be
+	// called. Resolution fails only when the target is not loaded in the host;
+	// that is a runtime property, not a build-time blocker, hence Info.
 	CodeForwardedExport CompatCode = "forwarded_export"
+
+	// CodeThreadNotifications: a manually mapped DLL is not registered in the
+	// loader's module list, so threads the payload itself creates never receive
+	// DLL_THREAD_ATTACH/DLL_THREAD_DETACH. Most payloads do not depend on it, but
+	// a CRT that lazily initialises per-thread state on attach can observe stale
+	// data. Informational; the loader cannot forward a notification it never sees.
+	CodeThreadNotifications CompatCode = "thread_notifications_not_delivered"
 )
 
 // CompatIssue is one finding. Detail carries the concrete numbers that made the
@@ -201,12 +210,19 @@ func Compat(payload []byte) (CompatIssues, error) {
 	}
 
 	// Forwarded exports resolve to a "DLL.Func" string inside the export
-	// directory, not to code. The loader calls exports by address, so it would
-	// jump into that string. Report them; Build also refuses a forwarded Method.
+	// directory, not to code. The loader resolves them at run time through the
+	// target module, matching the OS loader; see CodeForwardedExport.
 	for _, f := range forwardedExports(payload, pe) {
-		at(CompatWarning, CodeForwardedExport,
-			"export %q is a forwarder (%s); the loader calls exports by address and would jump into the forwarder string",
+		at(CompatInfo, CodeForwardedExport,
+			"export %q is a forwarder (%s); it is resolved through the target module at run time, so the target must be loaded in the host",
 			f.name, f.target)
+	}
+
+	// Thread notifications never reach a manually mapped image; report it for
+	// DLLs, whose runtimes are the ones that tend to rely on DLL_THREAD_ATTACH.
+	if binary.LittleEndian.Uint16(pe.fileHdr[18:])&fileDLL != 0 {
+		at(CompatInfo, CodeThreadNotifications,
+			"the image is not in the loader's module list, so threads the payload creates do not receive DLL_THREAD_ATTACH/DLL_THREAD_DETACH")
 	}
 
 	// TLS. The loader runs the callbacks (the directory is read from the saved
@@ -226,15 +242,13 @@ func Compat(payload []byte) (CompatIssues, error) {
 				rva, size)
 		case known && hasData:
 			at(CompatWarning, CodeTLSNotAllocated,
-				"TLS directory at rva 0x%x (%d bytes) declares thread-local data: callbacks run but no TLS index is allocated, "+
-					"so __declspec(thread) data is not zero-initialised (measured: expected 3, observed -2147483645)",
+				"TLS directory at rva 0x%x (%d bytes) declares a static template: the x64 loader registers it via LdrpHandleTlsData (best-effort), the x86 loader does not, so thread-local data is only reliable on x64",
 				rva, size)
 		default:
 			// Could not read the directory fields; stay conservative and keep the
 			// warning rather than silently downgrading an unverified image.
 			at(CompatWarning, CodeTLSNotAllocated,
-				"TLS directory at rva 0x%x (%d bytes): callbacks run but no TLS index is allocated, "+
-					"so __declspec(thread) data is not zero-initialised (measured: expected 3, observed -2147483645)",
+				"TLS directory at rva 0x%x (%d bytes): static TLS is registered on x64 (best-effort) but not on x86, so thread-local data is only reliable on x64",
 				rva, size)
 		}
 	}
@@ -415,8 +429,9 @@ func forwardedExports(data []byte, pe *peHeaders) []forwarder {
 	return out
 }
 
-// isForwardedExport reports whether the named export is a forwarder. Build uses it
-// to refuse a Method the loader could not call by address.
+// isForwardedExport reports whether the named export is a forwarder. Retained for
+// introspection even though Build no longer refuses forwarders: the loader
+// resolves them through their target module at run time.
 func isForwardedExport(data []byte, pe *peHeaders, name string) bool {
 	for _, f := range forwardedExports(data, pe) {
 		if f.name == name {
